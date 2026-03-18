@@ -1,18 +1,7 @@
-use crate::telemetry::task_metadata::{SpawnLocationId, TaskId};
+use crate::telemetry::{format::WorkerId, task_metadata::TaskId};
+use dial9_trace_format::InternedString;
 use serde::Serialize;
-
-/// Sentinel worker_id for events from non-worker threads (encoded as u8 on the wire).
-///
-/// Collides with a real worker index if the runtime has 255 worker threads.
-/// In practice this only affects very large machines; a future wire-format change
-/// (e.g. u16 worker index) would remove the limitation.
-pub const UNKNOWN_WORKER: usize = 255;
-
-/// Sentinel worker_id for events from tokio's blocking thread pool (encoded as u8 on the wire).
-///
-/// Same collision caveat as [`UNKNOWN_WORKER`]: collides with worker index 254 on machines
-/// with ≥254 runtime worker threads.
-pub const BLOCKING_WORKER: usize = 254;
+use std::sync::Arc;
 
 /// Role of a thread known to the telemetry system.
 #[cfg(feature = "cpu-profiling")]
@@ -42,6 +31,19 @@ impl CpuSampleSource {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ThreadName(Arc<str>);
+
+impl ThreadName {
+    pub fn new(name: String) -> Self {
+        Self(name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_ref()
+    }
+}
+
 /// Wire event representing a telemetry record after interning.
 ///
 /// Compare with `RawEvent` which is emitted by worker threads and carries
@@ -58,23 +60,23 @@ pub enum TelemetryEvent {
         #[serde(rename = "timestamp_ns")]
         timestamp_nanos: u64,
         #[serde(rename = "worker")]
-        worker_id: usize,
+        worker_id: WorkerId,
         #[serde(rename = "local_q")]
         worker_local_queue_depth: usize,
         task_id: TaskId,
-        spawn_loc_id: SpawnLocationId,
+        spawn_loc: InternedString,
     },
     PollEnd {
         #[serde(rename = "timestamp_ns")]
         timestamp_nanos: u64,
         #[serde(rename = "worker")]
-        worker_id: usize,
+        worker_id: WorkerId,
     },
     WorkerPark {
         #[serde(rename = "timestamp_ns")]
         timestamp_nanos: u64,
         #[serde(rename = "worker")]
-        worker_id: usize,
+        worker_id: WorkerId,
         #[serde(rename = "local_q")]
         worker_local_queue_depth: usize,
         /// Thread CPU time (nanos) from CLOCK_THREAD_CPUTIME_ID.
@@ -85,7 +87,7 @@ pub enum TelemetryEvent {
         #[serde(rename = "timestamp_ns")]
         timestamp_nanos: u64,
         #[serde(rename = "worker")]
-        worker_id: usize,
+        worker_id: WorkerId,
         #[serde(rename = "local_q")]
         worker_local_queue_depth: usize,
         /// Thread CPU time (nanos) from CLOCK_THREAD_CPUTIME_ID.
@@ -101,15 +103,11 @@ pub enum TelemetryEvent {
         #[serde(rename = "global_q")]
         global_queue_depth: usize,
     },
-    SpawnLocationDef {
-        id: SpawnLocationId,
-        location: String,
-    },
     TaskSpawn {
         #[serde(rename = "timestamp_ns")]
         timestamp_nanos: u64,
         task_id: TaskId,
-        spawn_loc_id: SpawnLocationId,
+        spawn_loc: InternedString,
     },
     TaskTerminate {
         #[serde(rename = "timestamp_ns")]
@@ -121,7 +119,7 @@ pub enum TelemetryEvent {
         #[serde(rename = "timestamp_ns")]
         timestamp_nanos: u64,
         #[serde(rename = "worker")]
-        worker_id: usize,
+        worker_id: WorkerId,
         /// OS thread ID that was sampled.
         tid: u32,
         /// What triggered this sample.
@@ -161,8 +159,6 @@ pub enum TelemetryEvent {
 
 impl TelemetryEvent {
     /// Returns the timestamp in nanoseconds, if this event type carries one.
-    ///
-    /// `SpawnLocationDef` and other definition records don't have timestamps.
     pub fn timestamp_nanos(&self) -> Option<u64> {
         match self {
             TelemetryEvent::PollStart {
@@ -192,9 +188,7 @@ impl TelemetryEvent {
             | TelemetryEvent::TaskTerminate {
                 timestamp_nanos, ..
             } => Some(*timestamp_nanos),
-            TelemetryEvent::SpawnLocationDef { .. }
-            | TelemetryEvent::CallframeDef { .. }
-            | TelemetryEvent::ThreadNameDef { .. } => None,
+            TelemetryEvent::CallframeDef { .. } | TelemetryEvent::ThreadNameDef { .. } => None,
             TelemetryEvent::SegmentMetadata {
                 timestamp_nanos, ..
             } => Some(*timestamp_nanos),
@@ -202,7 +196,7 @@ impl TelemetryEvent {
     }
 
     /// Returns the worker ID, if this event type is associated with a worker.
-    pub fn worker_id(&self) -> Option<usize> {
+    pub fn worker_id(&self) -> Option<WorkerId> {
         match self {
             TelemetryEvent::PollStart { worker_id, .. }
             | TelemetryEvent::PollEnd { worker_id, .. }
@@ -210,7 +204,6 @@ impl TelemetryEvent {
             | TelemetryEvent::WorkerUnpark { worker_id, .. }
             | TelemetryEvent::CpuSample { worker_id, .. } => Some(*worker_id),
             TelemetryEvent::QueueSample { .. }
-            | TelemetryEvent::SpawnLocationDef { .. }
             | TelemetryEvent::TaskSpawn { .. }
             | TelemetryEvent::TaskTerminate { .. }
             | TelemetryEvent::CallframeDef { .. }
@@ -221,7 +214,7 @@ impl TelemetryEvent {
     }
 
     /// Returns true if this is a runtime event (has a timestamp), as opposed to
-    /// a metadata record (SpawnLocationDef).
+    /// a metadata record.
     pub fn is_runtime_event(&self) -> bool {
         self.timestamp_nanos().is_some()
     }
@@ -234,24 +227,24 @@ impl TelemetryEvent {
 pub enum RawEvent {
     PollStart {
         timestamp_nanos: u64,
-        worker_id: usize,
+        worker_id: WorkerId,
         worker_local_queue_depth: usize,
         task_id: crate::telemetry::task_metadata::TaskId,
         location: &'static std::panic::Location<'static>,
     },
     PollEnd {
         timestamp_nanos: u64,
-        worker_id: usize,
+        worker_id: WorkerId,
     },
     WorkerPark {
         timestamp_nanos: u64,
-        worker_id: usize,
+        worker_id: WorkerId,
         worker_local_queue_depth: usize,
         cpu_time_nanos: u64,
     },
     WorkerUnpark {
         timestamp_nanos: u64,
-        worker_id: usize,
+        worker_id: WorkerId,
         worker_local_queue_depth: usize,
         cpu_time_nanos: u64,
         sched_wait_delta_nanos: u64,
@@ -279,8 +272,6 @@ pub enum RawEvent {
     CpuSample(Box<CpuSampleData>),
     /// Definition of a callframe symbol: maps an address to its resolved name.
     CallframeDef(Box<CallframeDefData>),
-    /// Maps an OS thread ID to its name.
-    ThreadNameDef(Box<ThreadNameDefData>),
 }
 
 /// Data for a CPU stack trace sample. Boxed inside [`RawEvent`] to keep the
@@ -288,8 +279,9 @@ pub enum RawEvent {
 #[derive(Debug, Clone)]
 pub struct CpuSampleData {
     pub timestamp_nanos: u64,
-    pub worker_id: usize,
+    pub worker_id: WorkerId,
     pub tid: u32,
+    pub thread_name: Option<ThreadName>,
     pub source: CpuSampleSource,
     pub callchain: Vec<u64>,
 }
@@ -300,13 +292,6 @@ pub struct CallframeDefData {
     pub address: u64,
     pub symbol: String,
     pub location: Option<String>,
-}
-
-/// Data for a thread name definition. Boxed inside [`RawEvent`].
-#[derive(Debug, Clone)]
-pub struct ThreadNameDefData {
-    pub tid: u32,
-    pub name: String,
 }
 
 /// Get the OS thread ID (tid) of the calling thread via `gettid()`.
@@ -343,6 +328,29 @@ pub fn thread_cpu_time_nanos() -> u64 {
 #[cfg(not(target_os = "linux"))]
 pub fn thread_cpu_time_nanos() -> u64 {
     0
+}
+
+/// Read `CLOCK_MONOTONIC` in nanoseconds. Used as the single time base for
+/// all trace timestamps (poll events, CPU samples, sched events).
+#[cfg(target_os = "linux")]
+pub fn clock_monotonic_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+    }
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn clock_monotonic_ns() -> u64 {
+    // Fallback: use Instant. This is fine for non-Linux where perf isn't available.
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
 }
 
 /// Per-thread scheduler stats from `/proc/<pid>/task/<tid>/schedstat`.
@@ -429,22 +437,24 @@ impl SchedStat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::telemetry::task_metadata::{UNKNOWN_SPAWN_LOCATION_ID, UNKNOWN_TASK_ID};
+    use crate::telemetry::task_metadata::UNKNOWN_TASK_ID;
+
+    const UNKNOWN_SPAWN_LOC: InternedString = InternedString::from_raw(0);
 
     #[test]
     fn test_telemetry_event_timestamp() {
         let poll_start = TelemetryEvent::PollStart {
             timestamp_nanos: 1000,
-            worker_id: 0,
+            worker_id: WorkerId(0),
             worker_local_queue_depth: 2,
             task_id: UNKNOWN_TASK_ID,
-            spawn_loc_id: UNKNOWN_SPAWN_LOCATION_ID,
+            spawn_loc: UNKNOWN_SPAWN_LOC,
         };
         assert_eq!(poll_start.timestamp_nanos(), Some(1000));
 
         let poll_end = TelemetryEvent::PollEnd {
             timestamp_nanos: 2000,
-            worker_id: 1,
+            worker_id: WorkerId(1),
         };
         assert_eq!(poll_end.timestamp_nanos(), Some(2000));
 
@@ -454,16 +464,10 @@ mod tests {
         };
         assert_eq!(queue_sample.timestamp_nanos(), Some(3000));
 
-        let spawn_def = TelemetryEvent::SpawnLocationDef {
-            id: SpawnLocationId::from_u16(1),
-            location: "src/main.rs:10:5".to_string(),
-        };
-        assert_eq!(spawn_def.timestamp_nanos(), None);
-
         let task_spawn = TelemetryEvent::TaskSpawn {
             timestamp_nanos: 5_000_000,
             task_id: TaskId::from_u32(1),
-            spawn_loc_id: SpawnLocationId::from_u16(1),
+            spawn_loc: InternedString::from_raw(1),
         };
         assert_eq!(task_spawn.timestamp_nanos(), Some(5_000_000));
     }
@@ -472,47 +476,42 @@ mod tests {
     fn test_telemetry_event_worker_id() {
         let poll_start = TelemetryEvent::PollStart {
             timestamp_nanos: 1000,
-            worker_id: 3,
+            worker_id: WorkerId(3),
             worker_local_queue_depth: 0,
             task_id: UNKNOWN_TASK_ID,
-            spawn_loc_id: UNKNOWN_SPAWN_LOCATION_ID,
+            spawn_loc: UNKNOWN_SPAWN_LOC,
         };
-        assert_eq!(poll_start.worker_id(), Some(3));
+        assert_eq!(poll_start.worker_id(), Some(WorkerId(3)));
 
         let queue_sample = TelemetryEvent::QueueSample {
             timestamp_nanos: 1000,
             global_queue_depth: 5,
         };
         assert_eq!(queue_sample.worker_id(), None);
-
-        let spawn_def = TelemetryEvent::SpawnLocationDef {
-            id: SpawnLocationId::from_u16(1),
-            location: "test".to_string(),
-        };
-        assert_eq!(spawn_def.worker_id(), None);
     }
 
     #[test]
     fn test_is_runtime_event() {
         let poll_start = TelemetryEvent::PollStart {
             timestamp_nanos: 1000,
-            worker_id: 0,
+            worker_id: WorkerId(0),
             worker_local_queue_depth: 0,
             task_id: UNKNOWN_TASK_ID,
-            spawn_loc_id: UNKNOWN_SPAWN_LOCATION_ID,
+            spawn_loc: UNKNOWN_SPAWN_LOC,
         };
         assert!(poll_start.is_runtime_event());
 
-        let spawn_def = TelemetryEvent::SpawnLocationDef {
-            id: SpawnLocationId::from_u16(1),
-            location: "test".to_string(),
+        let callframe_def = TelemetryEvent::CallframeDef {
+            address: 0x1234,
+            symbol: "test".to_string(),
+            location: None,
         };
-        assert!(!spawn_def.is_runtime_event());
+        assert!(!callframe_def.is_runtime_event());
 
         let task_spawn = TelemetryEvent::TaskSpawn {
             timestamp_nanos: 5_000_000,
             task_id: TaskId::from_u32(1),
-            spawn_loc_id: SpawnLocationId::from_u16(1),
+            spawn_loc: InternedString::from_raw(1),
         };
         assert!(task_spawn.is_runtime_event());
     }
@@ -521,20 +520,21 @@ mod tests {
     fn test_telemetry_event_creation() {
         let event = TelemetryEvent::PollStart {
             timestamp_nanos: 1000,
-            worker_id: 0,
+            worker_id: WorkerId(0),
             worker_local_queue_depth: 2,
             task_id: UNKNOWN_TASK_ID,
-            spawn_loc_id: UNKNOWN_SPAWN_LOCATION_ID,
+            spawn_loc: UNKNOWN_SPAWN_LOC,
         };
         assert_eq!(event.timestamp_nanos(), Some(1000));
-        assert_eq!(event.worker_id(), Some(0));
+        assert_eq!(event.worker_id(), Some(WorkerId(0)));
     }
 
     #[test]
     fn test_telemetry_event_clone() {
-        let event = TelemetryEvent::SpawnLocationDef {
-            id: SpawnLocationId::from_u16(42),
-            location: "src/lib.rs:1:1".to_string(),
+        let event = TelemetryEvent::CallframeDef {
+            address: 0x1234,
+            symbol: "src/lib.rs:1:1".to_string(),
+            location: None,
         };
         let cloned = event.clone();
         assert_eq!(event, cloned);

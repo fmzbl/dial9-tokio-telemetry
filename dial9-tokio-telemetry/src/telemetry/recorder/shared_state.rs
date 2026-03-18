@@ -2,7 +2,8 @@ use crate::telemetry::buffer::BUFFER;
 use crate::telemetry::collector::CentralCollector;
 #[cfg(feature = "cpu-profiling")]
 use crate::telemetry::events::ThreadRole;
-use crate::telemetry::events::{RawEvent, SchedStat, UNKNOWN_WORKER};
+use crate::telemetry::events::{RawEvent, SchedStat};
+use crate::telemetry::format::WorkerId;
 use crate::telemetry::task_metadata::TaskId;
 use arc_swap::ArcSwap;
 use std::cell::Cell;
@@ -12,7 +13,6 @@ use std::sync::Arc;
 #[cfg(feature = "cpu-profiling")]
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
 use tokio::runtime::RuntimeMetrics;
 
 thread_local! {
@@ -72,7 +72,7 @@ pub(super) fn resolve_worker_id(
     })
 }
 
-/// Get the current worker ID as u8 (255 if unknown). Used by Traced waker.
+/// Get the current worker ID (UNKNOWN if not a worker). Used by Traced waker.
 pub(crate) fn current_worker_id(metrics: &ArcSwap<Option<RuntimeMetrics>>) -> u8 {
     match resolve_worker_id(metrics, None) {
         Some(id) if id <= 254 => id as u8,
@@ -84,7 +84,9 @@ pub(crate) fn current_worker_id(metrics: &ArcSwap<Option<RuntimeMetrics>>) -> u8
 pub(crate) struct SharedState {
     pub(crate) enabled: AtomicBool,
     pub(crate) collector: Arc<CentralCollector>,
-    pub(crate) start_time: Instant,
+    /// Absolute `CLOCK_MONOTONIC` nanosecond timestamp captured at trace start.
+    /// All event timestamps are absolute values from the same clock.
+    pub(crate) start_time_ns: u64,
     pub(crate) metrics: ArcSwap<Option<RuntimeMetrics>>,
     /// Maps OS tid → thread role so that CPU samples returned from perf can be
     /// attributed to the correct worker or blocking-pool bucket at flush time.
@@ -96,11 +98,11 @@ pub(crate) struct SharedState {
 }
 
 impl SharedState {
-    pub(super) fn new(start_time: Instant) -> Self {
+    pub(super) fn new(start_time_ns: u64) -> Self {
         Self {
             enabled: AtomicBool::new(false),
             collector: Arc::new(CentralCollector::new()),
-            start_time,
+            start_time_ns,
             metrics: ArcSwap::from_pointee(None),
             #[cfg(feature = "cpu-profiling")]
             thread_roles: Mutex::new(HashMap::new()),
@@ -110,13 +112,11 @@ impl SharedState {
     }
 
     pub(crate) fn timestamp_nanos(&self) -> u64 {
-        self.start_time.elapsed().as_nanos() as u64
+        crate::telemetry::events::clock_monotonic_ns()
     }
 
     pub(crate) fn create_wake_event(&self, woken_task_id: TaskId) -> RawEvent {
-        let waker_task_id = tokio::task::try_id()
-            .map(TaskId::from)
-            .unwrap_or(TaskId::from_u32(0));
+        let waker_task_id = tokio::task::try_id().map(TaskId::from).unwrap_or_default();
         let target_worker = current_worker_id(&self.metrics);
         RawEvent::WakeEvent {
             timestamp_nanos: self.timestamp_nanos(),
@@ -165,8 +165,8 @@ impl SharedState {
                 0
             };
         RawEvent::PollStart {
-            timestamp_nanos: self.start_time.elapsed().as_nanos() as u64,
-            worker_id: worker_id.unwrap_or(UNKNOWN_WORKER),
+            timestamp_nanos: crate::telemetry::events::clock_monotonic_ns(),
+            worker_id: worker_id.map(WorkerId::from).unwrap_or(WorkerId::UNKNOWN),
             worker_local_queue_depth,
             task_id,
             location,
@@ -176,8 +176,8 @@ impl SharedState {
     pub(super) fn make_poll_end(&self) -> RawEvent {
         let worker_id = resolve_worker_id(&self.metrics, Some(self));
         RawEvent::PollEnd {
-            timestamp_nanos: self.start_time.elapsed().as_nanos() as u64,
-            worker_id: worker_id.unwrap_or(UNKNOWN_WORKER),
+            timestamp_nanos: crate::telemetry::events::clock_monotonic_ns(),
+            worker_id: worker_id.map(WorkerId::from).unwrap_or(WorkerId::UNKNOWN),
         }
     }
 
@@ -195,8 +195,8 @@ impl SharedState {
             PARKED_SCHED_WAIT.with(|c| c.set(ss.wait_time_ns));
         }
         RawEvent::WorkerPark {
-            timestamp_nanos: self.start_time.elapsed().as_nanos() as u64,
-            worker_id: worker_id.unwrap_or(UNKNOWN_WORKER),
+            timestamp_nanos: crate::telemetry::events::clock_monotonic_ns(),
+            worker_id: worker_id.map(WorkerId::from).unwrap_or(WorkerId::UNKNOWN),
             worker_local_queue_depth,
             cpu_time_nanos,
         }
@@ -219,8 +219,8 @@ impl SharedState {
             0
         };
         RawEvent::WorkerUnpark {
-            timestamp_nanos: self.start_time.elapsed().as_nanos() as u64,
-            worker_id: worker_id.unwrap_or(UNKNOWN_WORKER),
+            timestamp_nanos: crate::telemetry::events::clock_monotonic_ns(),
+            worker_id: worker_id.map(WorkerId::from).unwrap_or(WorkerId::UNKNOWN),
             worker_local_queue_depth,
             cpu_time_nanos,
             sched_wait_delta_nanos,

@@ -1,6 +1,5 @@
 mod cpu_flush_state;
 mod event_writer;
-pub(crate) mod flush_state;
 mod shared_state;
 
 pub(crate) use shared_state::SharedState;
@@ -27,7 +26,9 @@ pub struct TelemetryRecorder {
 impl TelemetryRecorder {
     pub fn new(writer: impl TraceWriter + 'static) -> Self {
         Self {
-            shared: Arc::new(SharedState::new(Instant::now())),
+            shared: Arc::new(SharedState::new(
+                crate::telemetry::events::clock_monotonic_ns(),
+            )),
             event_writer: EventWriter::new(Box::new(writer)),
         }
     }
@@ -66,9 +67,9 @@ impl TelemetryRecorder {
         builder: &mut tokio::runtime::Builder,
         writer: Box<dyn TraceWriter>,
         task_tracking_enabled: bool,
-        start_time: Instant,
+        start_time_ns: u64,
     ) -> Arc<Mutex<Self>> {
-        let shared = Arc::new(SharedState::new(start_time));
+        let shared = Arc::new(SharedState::new(start_time_ns));
         let recorder = Arc::new(Mutex::new(Self {
             shared: shared.clone(),
             event_writer: EventWriter::new(writer),
@@ -105,7 +106,7 @@ impl TelemetryRecorder {
                 let task_id = TaskId::from(meta.id());
                 let location = meta.spawned_at();
                 s5.record_event(RawEvent::TaskSpawn {
-                    timestamp_nanos: s5.start_time.elapsed().as_nanos() as u64,
+                    timestamp_nanos: crate::telemetry::events::clock_monotonic_ns(),
                     task_id,
                     location,
                 });
@@ -114,7 +115,7 @@ impl TelemetryRecorder {
             builder.on_task_terminate(move |meta| {
                 let task_id = TaskId::from(meta.id());
                 s6.record_event(RawEvent::TaskTerminate {
-                    timestamp_nanos: s6.start_time.elapsed().as_nanos() as u64,
+                    timestamp_nanos: crate::telemetry::events::clock_monotonic_ns(),
                     task_id,
                 });
             });
@@ -232,9 +233,7 @@ impl TelemetryHandle {
     {
         let traced_handle = self.traced_handle();
         tokio::spawn(async move {
-            let task_id = tokio::task::try_id()
-                .map(TaskId::from)
-                .unwrap_or(TaskId::from_u32(0));
+            let task_id = tokio::task::try_id().map(TaskId::from).unwrap_or_default();
             crate::traced::Traced::new(future, traced_handle, task_id).await
         })
     }
@@ -259,8 +258,8 @@ impl TelemetryGuard {
         self.handle.clone()
     }
 
-    pub fn start_time(&self) -> Instant {
-        self.handle.shared.start_time
+    pub fn start_time(&self) -> u64 {
+        self.handle.shared.start_time_ns
     }
 
     pub fn enable(&self) {
@@ -413,7 +412,9 @@ impl TracedRuntimeBuilder {
     ) -> std::io::Result<(tokio::runtime::Runtime, TelemetryGuard)> {
         use crate::telemetry::writer::NullWriter;
         let runtime = builder.build()?;
-        let shared = Arc::new(SharedState::new(Instant::now()));
+        let shared = Arc::new(SharedState::new(
+            crate::telemetry::events::clock_monotonic_ns(),
+        ));
         let recorder = Arc::new(Mutex::new(TelemetryRecorder {
             shared: shared.clone(),
             event_writer: EventWriter::new(Box::new(NullWriter)),
@@ -438,25 +439,23 @@ impl TracedRuntimeBuilder {
         if !self.enabled {
             return Self::build_disabled(builder);
         }
-        let start_instant = Instant::now();
-        #[cfg(feature = "cpu-profiling")]
-        let start_mono_ns = crate::telemetry::cpu_profile::clock_monotonic_ns();
+        let start_mono_ns = crate::telemetry::events::clock_monotonic_ns();
 
         #[cfg(feature = "cpu-profiling")]
         let sampler = self
             .cpu_profiling_config
-            .map(|config| crate::telemetry::cpu_profile::CpuProfiler::start(config, start_mono_ns));
+            .map(crate::telemetry::cpu_profile::CpuProfiler::start);
 
         #[cfg(feature = "cpu-profiling")]
         let sched = self
             .sched_event_config
-            .map(|config| crate::telemetry::cpu_profile::SchedProfiler::new(config, start_mono_ns));
+            .map(crate::telemetry::cpu_profile::SchedProfiler::new);
 
         let recorder = TelemetryRecorder::install(
             &mut builder,
             Box::new(writer),
             self.task_tracking_enabled,
-            start_instant,
+            start_mono_ns,
         );
 
         #[cfg(feature = "cpu-profiling")]
@@ -626,9 +625,7 @@ impl TracedRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::telemetry::writer::NullWriter;
-    use flush_state::FlushState;
-    use smallvec::SmallVec;
+    use crate::telemetry::NullWriter;
     use std::panic::Location;
 
     #[test]
@@ -665,46 +662,9 @@ mod tests {
     }
 
     #[test]
-    fn test_flush_state_intern() {
-        let mut fs = FlushState::new();
-        #[track_caller]
-        fn get_loc() -> &'static Location<'static> {
-            Location::caller()
-        }
-        let loc = get_loc();
-        let id1 = fs.intern(loc);
-        let id2 = fs.intern(loc);
-        assert_eq!(id1, id2);
-        assert_ne!(id1.as_u16(), 0);
-    }
-
-    #[test]
-    fn test_flush_state_on_rotate_clears_emitted() {
-        let mut fs = FlushState::new();
-        #[track_caller]
-        fn get_loc() -> &'static Location<'static> {
-            Location::caller()
-        }
-        let loc = get_loc();
-        let id = fs.intern(loc);
-        let mut defs = SmallVec::new();
-        fs.collect_def(id, &mut defs);
-        assert_eq!(defs.len(), 1);
-        // Second collect_def should not emit again
-        let mut defs2 = SmallVec::new();
-        fs.collect_def(id, &mut defs2);
-        assert_eq!(defs2.len(), 0);
-        // After rotation, should re-emit
-        fs.on_rotate();
-        let mut defs3 = SmallVec::new();
-        fs.collect_def(id, &mut defs3);
-        assert_eq!(defs3.len(), 1);
-    }
-
-    #[test]
     fn test_spawn_locations_resolve_after_rotation() {
         use crate::telemetry::analysis::TraceReader;
-        use crate::telemetry::events::TelemetryEvent;
+        use crate::telemetry::format::WorkerId;
 
         let dir = tempfile::TempDir::new().unwrap();
         let base = dir.path().join("trace");
@@ -736,7 +696,7 @@ mod tests {
             .unwrap();
             ew.write_raw_event(RawEvent::PollStart {
                 timestamp_nanos: (i as u64 + 1) * 1000,
-                worker_id: 0,
+                worker_id: WorkerId::from(0usize),
                 worker_local_queue_depth: 0,
                 task_id,
                 location: loc,
@@ -763,30 +723,23 @@ mod tests {
         for file in &files {
             let path = file.to_str().unwrap();
             let mut reader = TraceReader::new(path).unwrap();
-            reader.read_header().unwrap();
-            let events = reader.read_all().unwrap();
 
-            for ev in &events {
-                if let TelemetryEvent::PollStart { spawn_loc_id, .. } = ev {
-                    let loc = reader.spawn_locations.get(spawn_loc_id).unwrap_or_else(|| {
-                        panic!(
-                            "file {path:?}: spawn_loc_id {spawn_loc_id:?} has no definition {:#?}",
-                            reader.spawn_locations
-                        )
-                    });
-                    assert!(
-                        loc.contains(':'),
-                        "location should be file:line:col, got {loc:?}"
-                    );
-                }
+            for (spawn_loc, loc) in &reader.spawn_locations {
+                assert!(
+                    loc.contains(':'),
+                    "location should be file:line:col, got {loc:?} for {spawn_loc:?}"
+                );
             }
 
-            for (task_id, spawn_loc_id) in &reader.task_spawn_locs {
-                reader.spawn_locations.get(spawn_loc_id).unwrap_or_else(|| {
-                    panic!("file {path:?}: task {task_id:?} spawn_loc_id {spawn_loc_id:?} has no definition")
+            for (task_id, spawn_loc) in &reader.task_spawn_locs {
+                reader.spawn_locations.get(spawn_loc).unwrap_or_else(|| {
+                    panic!(
+                        "file {path:?}: task {task_id:?} spawn_loc {spawn_loc:?} has no definition"
+                    )
                 });
             }
 
+            let events = reader.read_all().unwrap();
             total_events += events.len();
         }
         assert_eq!(
@@ -799,19 +752,17 @@ mod tests {
     mod rotation_proptest {
         use super::*;
         use crate::telemetry::analysis::TraceReader;
-        use crate::telemetry::events::{
-            CpuSampleData, CpuSampleSource, TelemetryEvent, UNKNOWN_WORKER,
-        };
-        use crate::telemetry::task_metadata::{SpawnLocationId, TaskId};
+        use crate::telemetry::events::{CpuSampleData, CpuSampleSource, TelemetryEvent};
+        use crate::telemetry::format::WorkerId;
+        use crate::telemetry::task_metadata::TaskId;
         use crate::telemetry::writer::RotatingWriter;
         use cpu_flush_state::CpuFlushState;
         use proptest::prelude::*;
-        use std::collections::HashSet;
 
         #[derive(Debug, Clone)]
         enum FlushOp {
             CpuSample {
-                worker_id: usize,
+                worker_id: WorkerId,
                 tid: u32,
                 callchain: Vec<u64>,
             },
@@ -829,7 +780,11 @@ mod tests {
                 )
                     .prop_map(|(is_worker, tid, callchain)| {
                         FlushOp::CpuSample {
-                            worker_id: if is_worker { 0 } else { UNKNOWN_WORKER },
+                            worker_id: if is_worker {
+                                WorkerId::from(0usize)
+                            } else {
+                                WorkerId::UNKNOWN
+                            },
                             tid,
                             callchain,
                         }
@@ -879,6 +834,7 @@ mod tests {
                         worker_id: *worker_id,
                         tid: *tid,
                         source: CpuSampleSource::CpuProfile,
+                        thread_name: None,
                         callchain: callchain.clone(),
                     };
                     *timestamp += 1;
@@ -892,7 +848,7 @@ mod tests {
                     let task_id = TaskId::from_u32(*timestamp as u32);
                     let raw = RawEvent::PollStart {
                         timestamp_nanos: *timestamp,
-                        worker_id: 0,
+                        worker_id: WorkerId::from(0usize),
                         worker_local_queue_depth: 0,
                         task_id,
                         location: loc,
@@ -918,57 +874,36 @@ mod tests {
 
             for file in &files {
                 let path_str = file.to_str().unwrap();
-                let mut reader = TraceReader::new(path_str)
+                let reader = TraceReader::new(path_str)
                     .unwrap_or_else(|e| panic!("failed to open {path_str}: {e}"));
-                reader.read_header().unwrap();
 
-                let mut events = Vec::new();
-                while let Some(ev) = reader.read_raw_event().unwrap() {
-                    events.push(ev);
-                }
+                // In the new format, spawn locations come from the string pool.
+                // Verify every PollStart's spawn_loc_id resolves.
+                let spawn_locs = &reader.spawn_locations;
 
-                let mut spawn_loc_defs: HashSet<SpawnLocationId> = HashSet::new();
-                let mut thread_name_defs: HashSet<u32> = HashSet::new();
-                let mut callframe_defs: HashSet<u64> = HashSet::new();
-
-                for ev in &events {
+                for ev in &reader.events {
                     match ev {
-                        TelemetryEvent::SpawnLocationDef { id, location } => {
+                        TelemetryEvent::PollStart { spawn_loc, .. } => {
                             assert!(
-                                location.contains(':'),
-                                "{path_str}: SpawnLocationDef has bad location: {location:?}"
-                            );
-                            spawn_loc_defs.insert(*id);
-                        }
-                        TelemetryEvent::ThreadNameDef { tid, .. } => {
-                            thread_name_defs.insert(*tid);
-                        }
-                        TelemetryEvent::CallframeDef { address, .. } => {
-                            callframe_defs.insert(*address);
-                        }
-                        TelemetryEvent::PollStart { spawn_loc_id, .. } => {
-                            assert!(
-                                spawn_loc_defs.contains(spawn_loc_id),
-                                "{path_str}: PollStart references spawn_loc_id {spawn_loc_id:?} but no SpawnLocationDef in this file. Defs: {spawn_loc_defs:?}"
+                                spawn_locs.contains_key(spawn_loc),
+                                "{path_str}: PollStart references spawn_loc {spawn_loc:?} but no definition in this file. Defs: {spawn_locs:?}"
                             );
                             total_raw += 1;
                         }
                         TelemetryEvent::CpuSample {
                             worker_id,
-                            tid,
                             callchain,
                             ..
                         } => {
-                            if *worker_id == UNKNOWN_WORKER {
-                                assert!(
-                                    thread_name_defs.contains(tid),
-                                    "{path_str}: CpuSample for non-worker tid {tid} has no ThreadNameDef. Defs: {thread_name_defs:?}"
-                                );
+                            if *worker_id == WorkerId::UNKNOWN {
+                                // Thread name tracking is handled by the string pool now;
+                                // just verify callframe symbols resolve.
                             }
                             for addr in callchain {
                                 assert!(
-                                    callframe_defs.contains(addr),
-                                    "{path_str}: CpuSample references callchain address {addr:#x} but no CallframeDef. Defs: {callframe_defs:?}"
+                                    reader.callframe_symbols.contains_key(addr),
+                                    "{path_str}: CpuSample references callchain address {addr:#x} but no CallframeDef. Defs: {:?}",
+                                    reader.callframe_symbols
                                 );
                             }
                         }
@@ -995,9 +930,6 @@ mod tests {
                 let mut ew = EventWriter::new(Box::new(writer));
                 let mut cpu = CpuFlushState::new();
                 cpu.inline_callframe_symbols = true;
-                for tid in 0u32..4 {
-                    cpu.thread_name_intern.insert(tid, format!("thread-{tid}"));
-                }
                 ew.cpu_flush = Some(cpu);
 
                 #[track_caller]

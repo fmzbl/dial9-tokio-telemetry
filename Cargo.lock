@@ -1398,6 +1398,7 @@ dependencies = [
  "libc",
  "perf-event-data",
  "perf-event-open-sys2",
+ "tracing",
 ]
 
 [[package]]
@@ -1415,6 +1416,7 @@ dependencies = [
  "criterion",
  "dial9-perf-self-profile",
  "dial9-tokio-telemetry",
+ "dial9-trace-format",
  "flate2",
  "futures-util",
  "hdrhistogram",

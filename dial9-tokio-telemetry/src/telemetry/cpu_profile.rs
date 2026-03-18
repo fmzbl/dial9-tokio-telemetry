@@ -4,7 +4,7 @@
 //! configurable frequency. The flush thread drains raw samples; the caller
 //! (EventWriter) maps OS thread IDs to worker IDs via SharedState.thread_roles.
 
-use crate::telemetry::events::CpuSampleSource;
+use crate::telemetry::events::{CpuSampleSource, ThreadName};
 use dial9_perf_self_profile::{EventSource, PerfSampler, SamplerConfig};
 use std::collections::HashMap;
 use std::io;
@@ -60,15 +60,14 @@ pub(crate) struct RawCpuSample {
 /// Manages the process-wide perf sampler. Yields raw samples without worker IDs.
 pub(crate) struct CpuProfiler {
     sampler: PerfSampler,
-    clock_offset: u64,
     pid: u32,
     /// OS tid → thread name, eagerly cached at drain time so short-lived threads
     /// are captured before they exit and `/proc/self/task/<tid>/comm` disappears.
-    tid_to_name: HashMap<u32, String>,
+    tid_to_name: HashMap<u32, ThreadName>,
 }
 
 impl CpuProfiler {
-    pub fn start(config: CpuProfilingConfig, trace_start_mono_ns: u64) -> io::Result<Self> {
+    pub fn start(config: CpuProfilingConfig) -> io::Result<Self> {
         let sampler = PerfSampler::start(SamplerConfig {
             frequency_hz: config.frequency_hz,
             event_source: config.event_source,
@@ -76,7 +75,6 @@ impl CpuProfiler {
         })?;
         Ok(Self {
             sampler,
-            clock_offset: trace_start_mono_ns,
             pid: std::process::id(),
             tid_to_name: HashMap::new(),
         })
@@ -86,7 +84,7 @@ impl CpuProfiler {
     ///
     /// Filters out child-process samples (perf `inherit` leaks them).
     /// Eagerly caches thread names for non-worker tids.
-    pub fn drain(&mut self, mut f: impl FnMut(RawCpuSample, Option<&str>)) {
+    pub fn drain(&mut self, mut f: impl FnMut(RawCpuSample, Option<&ThreadName>)) {
         let pid = self.pid;
         self.sampler.for_each_sample(|sample| {
             if sample.pid != pid {
@@ -95,13 +93,13 @@ impl CpuProfiler {
             if !self.tid_to_name.contains_key(&sample.tid)
                 && let Some(name) = read_thread_name(sample.tid)
             {
-                self.tid_to_name.insert(sample.tid, name);
+                self.tid_to_name.insert(sample.tid, ThreadName::new(name));
             }
-            let thread_name = self.tid_to_name.get(&sample.tid).map(|s| s.as_str());
+            let thread_name = self.tid_to_name.get(&sample.tid);
             f(
                 RawCpuSample {
                     tid: sample.tid,
-                    timestamp_nanos: sample.time.saturating_sub(self.clock_offset),
+                    timestamp_nanos: sample.time,
                     callchain: sample.callchain.clone(),
                     source: CpuSampleSource::CpuProfile,
                 },
@@ -111,35 +109,19 @@ impl CpuProfiler {
     }
 }
 
-/// Read `CLOCK_MONOTONIC` in nanoseconds.
-pub(crate) fn clock_monotonic_ns() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    unsafe {
-        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
-    }
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
-}
-
 /// Per-thread sched event profiler. Yields raw samples without worker IDs.
 pub(crate) struct SchedProfiler {
     sampler: PerfSampler,
-    clock_offset: u64,
 }
 
 impl SchedProfiler {
-    pub fn new(config: SchedEventConfig, trace_start_mono_ns: u64) -> io::Result<Self> {
+    pub fn new(config: SchedEventConfig) -> io::Result<Self> {
         let sampler = PerfSampler::new_per_thread(SamplerConfig {
             frequency_hz: 1,
             event_source: EventSource::SwContextSwitches,
             include_kernel: config.include_kernel,
         })?;
-        Ok(Self {
-            sampler,
-            clock_offset: trace_start_mono_ns,
-        })
+        Ok(Self { sampler })
     }
 
     pub fn track_current_thread(&mut self) -> io::Result<()> {
@@ -154,7 +136,7 @@ impl SchedProfiler {
         self.sampler.for_each_sample(|sample| {
             f(RawCpuSample {
                 tid: sample.tid,
-                timestamp_nanos: sample.time.saturating_sub(self.clock_offset),
+                timestamp_nanos: sample.time,
                 callchain: sample.callchain.clone(),
                 source: CpuSampleSource::SchedEvent,
             });
