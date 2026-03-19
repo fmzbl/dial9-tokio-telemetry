@@ -6,10 +6,8 @@ pub(crate) mod pipeline_metrics;
 pub mod s3;
 pub(crate) mod sealed;
 
+use crate::metrics::{Operation, SegmentProcessMetrics, SegmentProcessMetricsGuard};
 use metrique::timers::Timer;
-use metrique::unit::Byte;
-use metrique::unit::Millisecond;
-use metrique::unit_of_work::metrics;
 use metrique_writer::BoxEntrySink;
 use pipeline_metrics::{MetriqueResult, PipelineMetrics, StageMetrics};
 use std::collections::HashMap;
@@ -26,7 +24,6 @@ pub(crate) const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 ///
 /// - `poll_interval`: how often to check for sealed segments (default: 1 second)
 /// - `client`: pre-built `aws_sdk_s3::Client` for custom credentials or endpoints
-/// - `metrics_sink`: receives per-segment pipeline metrics (compression ratio, upload latency, etc.)
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
 pub struct BackgroundTaskConfig {
@@ -97,7 +94,6 @@ impl BackgroundTaskConfig {
 /// The worker reads the sealed segment file into `bytes`, populates initial
 /// `metadata`, then passes this through each [`SegmentProcessor`] in order.
 /// Metrics are flushed automatically when the `SegmentData` is dropped.
-#[derive(Debug)]
 pub(crate) struct SegmentData {
     /// Original sealed segment (path, index).
     // dead if s3 is not enabled
@@ -111,6 +107,17 @@ pub(crate) struct SegmentData {
     pub(crate) metadata: HashMap<String, String>,
     /// Metrics guard — processors can record metrics; flushed on drop.
     pub(crate) metrics: SegmentProcessMetricsGuard,
+}
+
+impl std::fmt::Debug for SegmentData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SegmentData")
+            .field("segment", &self.segment)
+            .field("bytes", &format_args!("[{} bytes]", self.bytes.len()))
+            .field("metadata", &self.metadata)
+            .field("metrics", &self.metrics)
+            .finish()
+    }
 }
 
 /// Error returned by a [`SegmentProcessor`].
@@ -229,11 +236,12 @@ pub(crate) fn run_background_task(
         .expect("failed to create worker runtime");
 
     let processors = rt.block_on(build_pipeline(&mut config));
+    let metrics_sink = config.metrics_sink.clone();
 
     tracing::info!(target: "dial9_worker", dir = %config.trace_dir().display(), stem = %config.trace_stem(), processors = processors.len(), "worker started");
     rt.block_on(async {
         let stop = tokio_util::sync::CancellationToken::new();
-        let mut worker = WorkerLoop::new(config, processors, stop.clone());
+        let mut worker = WorkerLoop::new(config, processors, stop.clone(), metrics_sink);
         let mut run_fut = std::pin::pin!(worker.run());
         // Poll the worker until we receive a shutdown signal with a drain timeout.
         let drain_timeout = tokio::select! {
@@ -403,29 +411,6 @@ impl SegmentProcessor for WriteBackProcessor {
 }
 
 // ---------------------------------------------------------------------------
-// Metrics
-// ---------------------------------------------------------------------------
-
-#[metrics(rename_all = "PascalCase")]
-#[derive(Debug)]
-pub(crate) struct SegmentProcessMetrics {
-    #[metrics(unit = Millisecond)]
-    total_time: Timer,
-    #[metrics(flatten)]
-    status: Option<MetriqueResult>,
-    segment_index: u32,
-    #[metrics(unit = Byte)]
-    uncompressed_size: u64,
-    #[metrics(unit = Byte)]
-    compressed_size: Option<u64>,
-    /// True when the segment file lacks a valid SegmentMetadata header.
-    invalid_file_header: bool,
-    /// Per-processor metrics, keyed by processor name.
-    #[metrics(flatten)]
-    pipeline: PipelineMetrics,
-}
-
-// ---------------------------------------------------------------------------
 // WorkerLoop — the async state machine
 // ---------------------------------------------------------------------------
 
@@ -445,13 +430,14 @@ impl WorkerLoop {
         config: BackgroundTaskConfig,
         processors: Vec<Box<dyn SegmentProcessor>>,
         stop: tokio_util::sync::CancellationToken,
+        metrics_sink: BoxEntrySink,
     ) -> Self {
         Self {
             dir: config.trace_dir().to_path_buf(),
             stem: config.trace_stem().to_string(),
             poll_interval: config.poll_interval(),
             processors,
-            metrics_sink: config.metrics_sink,
+            metrics_sink,
             stop,
         }
     }
@@ -513,6 +499,7 @@ impl WorkerLoop {
             let (epoch_secs, header_valid) = sealed::creation_epoch_secs(&bytes, &segment.path);
 
             let metrics = SegmentProcessMetrics {
+                operation: Operation::ProcessSegment,
                 total_time: Timer::start_now(),
                 status: None,
                 segment_index: segment.index,
@@ -819,6 +806,7 @@ mod tests {
         };
 
         let metrics = SegmentProcessMetrics {
+            operation: Operation::ProcessSegment,
             total_time: metrique::timers::Timer::start_now(),
             status: None,
             segment_index: 0,
@@ -932,7 +920,12 @@ mod tests {
         let processors: Vec<Box<dyn SegmentProcessor>> =
             vec![Box::new(CountingProcessor(processed.clone()))];
 
-        let mut worker = WorkerLoop::new(config, processors, stop);
+        let mut worker = WorkerLoop::new(
+            config,
+            processors,
+            stop,
+            metrique_writer::sink::DevNullSink::boxed(),
+        );
         worker.run().await;
 
         // Worker should have drained both segments even though stop was set
@@ -996,7 +989,12 @@ mod tests {
             calls: 0,
         })];
 
-        let mut worker = WorkerLoop::new(config, processors, stop);
+        let mut worker = WorkerLoop::new(
+            config,
+            processors,
+            stop,
+            metrique_writer::sink::DevNullSink::boxed(),
+        );
         worker.run().await;
 
         // Second segment should still be processed despite first failing
@@ -1104,7 +1102,12 @@ mod worker_pipeline_tests {
         let stop = tokio_util::sync::CancellationToken::new();
         let processors: Vec<Box<dyn SegmentProcessor>> = vec![Box::new(AlwaysFailProcessor)];
 
-        let mut worker = WorkerLoop::new(config_for(dir.path()), processors, stop);
+        let mut worker = WorkerLoop::new(
+            config_for(dir.path()),
+            processors,
+            stop,
+            metrique_writer::sink::DevNullSink::boxed(),
+        );
         worker.process_open_segments().await;
 
         check!(!seg_path.exists());
@@ -1149,7 +1152,12 @@ mod worker_pipeline_tests {
             Box::new(CaptureProcessor(output_bytes.clone())),
         ];
 
-        let mut worker = WorkerLoop::new(config_for(dir.path()), processors, stop);
+        let mut worker = WorkerLoop::new(
+            config_for(dir.path()),
+            processors,
+            stop,
+            metrique_writer::sink::DevNullSink::boxed(),
+        );
         worker.run().await;
 
         // The captured bytes should be identical to the input (not double-gzipped).
