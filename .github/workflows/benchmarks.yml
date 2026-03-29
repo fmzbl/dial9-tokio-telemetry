@@ -1,0 +1,142 @@
+# Continuous benchmarking with Bencher (https://bencher.dev)
+#
+# PREREQUISITES:
+#   1. Create a project at https://bencher.dev with slug: dial9-tokio-telemetry
+#   2. Generate an API token and add it as secret BENCHER_API_TOKEN in:
+#      GitHub → Settings → Secrets and variables → Actions
+#   3. GITHUB_TOKEN is provided automatically — no setup needed.
+#
+# NOTE: overhead_bench is excluded — it uses a custom harness with a 30s+
+# runtime that is too slow and variable for continuous regression tracking.
+
+name: Benchmarks
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  checks: write
+  pull-requests: write
+
+jobs:
+  # Runs on every push to main to build the statistical baseline.
+  benchmark_main:
+    name: Benchmark (main baseline)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Enable perf_event_open and kallsyms
+        run: |
+          sudo sysctl kernel.perf_event_paranoid=1
+          sudo sysctl kernel.kptr_restrict=0
+
+      - uses: bencherdev/bencher@main
+
+      - name: Benchmark — poll_overhead
+        run: |
+          bencher run \
+            --project dial9-tokio-telemetry \
+            --token '${{ secrets.BENCHER_API_TOKEN }}' \
+            --branch main \
+            --testbed ubuntu-latest \
+            --adapter criterion \
+            "cargo bench --package dial9-tokio-telemetry --bench poll_overhead --features task-dump"
+
+      - name: Benchmark — writer_encode
+        run: |
+          bencher run \
+            --project dial9-tokio-telemetry \
+            --token '${{ secrets.BENCHER_API_TOKEN }}' \
+            --branch main \
+            --testbed ubuntu-latest \
+            --adapter criterion \
+            "cargo bench --package dial9-tokio-telemetry --bench writer_encode"
+
+      - name: Benchmark — codec
+        run: |
+          bencher run \
+            --project dial9-tokio-telemetry \
+            --token '${{ secrets.BENCHER_API_TOKEN }}' \
+            --branch main \
+            --testbed ubuntu-latest \
+            --adapter criterion \
+            "cargo bench --package dial9-trace-format --bench codec"
+
+  # Runs on same-repo PRs. Fork PRs are skipped — they have no access to
+  # BENCHER_API_TOKEN, so the job would fail rather than silently skip.
+  benchmark_pr:
+    name: Benchmark (PR regression check)
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Enable perf_event_open and kallsyms
+        run: |
+          sudo sysctl kernel.perf_event_paranoid=1
+          sudo sysctl kernel.kptr_restrict=0
+
+      - uses: bencherdev/bencher@main
+
+      - name: Benchmark — poll_overhead
+        run: |
+          bencher run \
+            --project dial9-tokio-telemetry \
+            --token '${{ secrets.BENCHER_API_TOKEN }}' \
+            --branch '${{ github.head_ref }}' \
+            --start-point main \
+            --start-point-reset \
+            --testbed ubuntu-latest \
+            --adapter criterion \
+            --threshold-test percentage \
+            --threshold-upper-boundary 0.25 \
+            --error-on-alert \
+            --github-actions '${{ secrets.GITHUB_TOKEN }}' \
+            "cargo bench --package dial9-tokio-telemetry --bench poll_overhead --features task-dump"
+
+      - name: Benchmark — writer_encode
+        run: |
+          bencher run \
+            --project dial9-tokio-telemetry \
+            --token '${{ secrets.BENCHER_API_TOKEN }}' \
+            --branch '${{ github.head_ref }}' \
+            --start-point main \
+            --start-point-reset \
+            --testbed ubuntu-latest \
+            --adapter criterion \
+            --threshold-test percentage \
+            --threshold-upper-boundary 0.25 \
+            --error-on-alert \
+            --github-actions '${{ secrets.GITHUB_TOKEN }}' \
+            "cargo bench --package dial9-tokio-telemetry --bench writer_encode"
+
+      - name: Benchmark — codec
+        run: |
+          bencher run \
+            --project dial9-tokio-telemetry \
+            --token '${{ secrets.BENCHER_API_TOKEN }}' \
+            --branch '${{ github.head_ref }}' \
+            --start-point main \
+            --start-point-reset \
+            --testbed ubuntu-latest \
+            --adapter criterion \
+            --threshold-test percentage \
+            --threshold-upper-boundary 0.25 \
+            --error-on-alert \
+            --github-actions '${{ secrets.GITHUB_TOKEN }}' \
+            "cargo bench --package dial9-trace-format --bench codec"
