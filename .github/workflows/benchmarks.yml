@@ -49,7 +49,7 @@ jobs:
             --token '${{ secrets.BENCHER_API_TOKEN }}' \
             --branch main \
             --testbed ubuntu-latest \
-            --adapter criterion \
+            --adapter rust_criterion \
             "cargo bench --package dial9-tokio-telemetry --bench poll_overhead --features task-dump"
 
       - name: Benchmark — writer_encode
@@ -59,7 +59,7 @@ jobs:
             --token '${{ secrets.BENCHER_API_TOKEN }}' \
             --branch main \
             --testbed ubuntu-latest \
-            --adapter criterion \
+            --adapter rust_criterion \
             "cargo bench --package dial9-tokio-telemetry --bench writer_encode"
 
       - name: Benchmark — codec
@@ -69,7 +69,7 @@ jobs:
             --token '${{ secrets.BENCHER_API_TOKEN }}' \
             --branch main \
             --testbed ubuntu-latest \
-            --adapter criterion \
+            --adapter rust_criterion \
             "cargo bench --package dial9-trace-format --bench codec"
 
   # Runs on same-repo PRs. Fork PRs are skipped — they have no access to
@@ -102,7 +102,7 @@ jobs:
             --start-point main \
             --start-point-reset \
             --testbed ubuntu-latest \
-            --adapter criterion \
+            --adapter rust_criterion \
             --threshold-test percentage \
             --threshold-upper-boundary 0.25 \
             --error-on-alert \
@@ -118,7 +118,7 @@ jobs:
             --start-point main \
             --start-point-reset \
             --testbed ubuntu-latest \
-            --adapter criterion \
+            --adapter rust_criterion \
             --threshold-test percentage \
             --threshold-upper-boundary 0.25 \
             --error-on-alert \
@@ -134,7 +134,7 @@ jobs:
             --start-point main \
             --start-point-reset \
             --testbed ubuntu-latest \
-            --adapter criterion \
+            --adapter rust_criterion \
             --threshold-test percentage \
             --threshold-upper-boundary 0.25 \
             --error-on-alert \
