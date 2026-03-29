@@ -7,6 +7,10 @@ use metrique::timers::Timer;
 use metrique::unit::{Byte, Microsecond, Millisecond};
 use metrique::unit_of_work::metrics;
 
+pub enum Test {
+    A,
+    B
+}
 /// Distinguishes the type of operation a metric entry describes.
 #[derive(Clone, Copy)]
 #[metrics(value(string))]
