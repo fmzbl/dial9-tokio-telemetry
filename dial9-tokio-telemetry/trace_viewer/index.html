@@ -388,6 +388,7 @@
                 <button id="btn-zoom-out">Zoom −</button>
                 <button id="btn-fit">Fit All</button>
                 <button id="btn-time-mode" title="Toggle between relative (offset from trace start) and absolute timestamps">Time: Relative</button>
+                <button id="btn-tz-mode" title="Toggle between UTC and local timezone for absolute timestamps" style="display:none">TZ: UTC</button>
                 <button id="btn-reset">New File</button>
             </div>
             <div id="main-area" tabindex="0" role="application" aria-label="Trace timeline">
@@ -570,17 +571,36 @@
                 maxTs = 0,
                 durationNs = 0;
             let useAbsoluteTime = false;
+            let useLocalTz = false;
 
-            // Format a timestamp (ns) for display. In relative mode, shows
-            // offset from trace start with a "+" prefix. In absolute mode,
-            // shows the raw timestamp value.
-            function fmtTs(ns) {
-                const v = useAbsoluteTime ? ns : ns - minTs;
-                const prefix = useAbsoluteTime ? "" : "+";
+            function fmtDuration(ns) {
+                const prefix = "+";
+                const v = ns;
                 if (v >= 1e9) return prefix + (v / 1e9).toFixed(2) + "s";
                 if (v >= 1e6) return prefix + (v / 1e6).toFixed(2) + "ms";
                 if (v >= 1e3) return prefix + (v / 1e3).toFixed(1) + "µs";
                 return prefix + v.toFixed(0) + "ns";
+            }
+
+            function fmtWallClock(ns) {
+                const ms = ns / 1e6;
+                const d = new Date(ms);
+                const pad2 = n => String(n).padStart(2, "0");
+                if (useLocalTz) {
+                    return pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" +
+                        pad2(d.getSeconds());
+                } else {
+                    return pad2(d.getUTCHours()) + ":" + pad2(d.getUTCMinutes()) + ":" +
+                        pad2(d.getUTCSeconds());
+                }
+            }
+
+            // Format a timestamp (ns) for display. In relative mode, shows
+            // offset from trace start with a "+" prefix. In absolute mode,
+            // shows wall-clock time.
+            function fmtTs(ns) {
+                if (useAbsoluteTime) return fmtWallClock(ns);
+                return fmtDuration(ns - minTs);
             }
             // View window in nanoseconds
             let viewStart = 0,
@@ -2097,6 +2117,14 @@
                 useAbsoluteTime = !useAbsoluteTime;
                 document.getElementById("btn-time-mode").textContent =
                     useAbsoluteTime ? "Time: Absolute" : "Time: Relative";
+                document.getElementById("btn-tz-mode").style.display =
+                    useAbsoluteTime ? "" : "none";
+                renderAll();
+            });
+            document.getElementById("btn-tz-mode").addEventListener("click", () => {
+                useLocalTz = !useLocalTz;
+                document.getElementById("btn-tz-mode").textContent =
+                    useLocalTz ? "TZ: Local" : "TZ: UTC";
                 renderAll();
             });
 
