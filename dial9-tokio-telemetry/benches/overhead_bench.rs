@@ -258,9 +258,18 @@ fn main() {
             let rps = r.hist.len() as f64 / r.wall.as_secs_f64();
             let p = format!("overhead::{mode}");
             report.insert(format!("{p}::throughput_rps"), bmf::Metric::throughput(rps));
-            report.insert(format!("{p}::mean_lat_ns"), bmf::Metric::latency(r.hist.mean()));
-            report.insert(format!("{p}::p99_lat_ns"), bmf::Metric::latency(r.hist.value_at_percentile(99.0) as f64));
-            report.insert(format!("{p}::p99_9_lat_ns"), bmf::Metric::latency(r.hist.value_at_percentile(99.9) as f64));
+            report.insert(
+                format!("{p}::mean_lat_ns"),
+                bmf::Metric::latency(r.hist.mean()),
+            );
+            report.insert(
+                format!("{p}::p99_lat_ns"),
+                bmf::Metric::latency(r.hist.value_at_percentile(99.0) as f64),
+            );
+            report.insert(
+                format!("{p}::p99_9_lat_ns"),
+                bmf::Metric::latency(r.hist.value_at_percentile(99.9) as f64),
+            );
         }
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
         return;

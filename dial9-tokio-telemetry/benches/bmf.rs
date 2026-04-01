@@ -22,9 +22,15 @@ pub struct Measure {
 
 impl Metric {
     pub fn latency(value: f64) -> Self {
-        Self { latency: Some(Measure { value }), throughput: None }
+        Self {
+            latency: Some(Measure { value }),
+            throughput: None,
+        }
     }
     pub fn throughput(value: f64) -> Self {
-        Self { latency: None, throughput: Some(Measure { value }) }
+        Self {
+            latency: None,
+            throughput: Some(Measure { value }),
+        }
     }
 }
