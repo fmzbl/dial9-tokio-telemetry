@@ -6,8 +6,8 @@
 #      GitHub → Settings → Secrets and variables → Actions
 #   3. GITHUB_TOKEN is provided automatically — no setup needed.
 #
-# NOTE: overhead_bench is excluded — it uses a custom harness with a 30s+
-# runtime that is too slow and variable for continuous regression tracking.
+# overhead_bench uses a custom harness (not Criterion). Its JSON output is
+# converted to Bencher Metric Format (BMF) via jq before submission.
 
 name: Benchmarks
 
@@ -16,6 +16,7 @@ on:
     branches:
       - main
   pull_request:
+  workflow_dispatch:
 
 permissions:
   checks: write
@@ -25,7 +26,7 @@ jobs:
   # Runs on every push to main to build the statistical baseline.
   benchmark_main:
     name: Benchmark (main baseline)
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -71,6 +72,32 @@ jobs:
             --testbed ubuntu-latest \
             --adapter rust_criterion \
             "cargo bench --package dial9-trace-format --bench codec"
+
+      - name: Run overhead_bench (all modes, 10s each)
+        run: |
+          cargo bench --bench overhead_bench -- baseline 10 --json > /tmp/ob_baseline.json
+          cargo bench --bench overhead_bench -- telemetry 10 --json > /tmp/ob_telemetry.json
+          cargo bench --bench overhead_bench -- noop 10 --json > /tmp/ob_noop.json
+
+      - name: Benchmark — overhead_bench
+        run: |
+          jq -s '
+            def bmf(mode):
+              {
+                ("overhead::" + mode + "::throughput_rps"): {"throughput": {"value": .throughput_rps}},
+                ("overhead::" + mode + "::mean_lat_ns"):    {"latency":    {"value": .mean_lat_ns}},
+                ("overhead::" + mode + "::p99_lat_ns"):     {"latency":    {"value": .p99_lat_ns}},
+                ("overhead::" + mode + "::p99_9_lat_ns"):   {"latency":    {"value": .p99_9_lat_ns}}
+              };
+            (.[0] | bmf("baseline")) * (.[1] | bmf("telemetry")) * (.[2] | bmf("noop"))
+          ' /tmp/ob_baseline.json /tmp/ob_telemetry.json /tmp/ob_noop.json > /tmp/ob_bmf.json
+          bencher run \
+            --project dial9-tokio-telemetry \
+            --token '${{ secrets.BENCHER_API_TOKEN }}' \
+            --branch main \
+            --testbed ubuntu-latest \
+            --adapter json \
+            "cat /tmp/ob_bmf.json"
 
   # Runs on same-repo PRs. Fork PRs are skipped — they have no access to
   # BENCHER_API_TOKEN, so the job would fail rather than silently skip.
@@ -140,3 +167,35 @@ jobs:
             --error-on-alert \
             --github-actions '${{ secrets.GITHUB_TOKEN }}' \
             "cargo bench --package dial9-trace-format --bench codec"
+
+      - name: Run overhead_bench (all modes, 10s each)
+        run: |
+          cargo bench --bench overhead_bench -- baseline 10 --json > /tmp/ob_baseline.json
+          cargo bench --bench overhead_bench -- telemetry 10 --json > /tmp/ob_telemetry.json
+          cargo bench --bench overhead_bench -- noop 10 --json > /tmp/ob_noop.json
+
+      - name: Benchmark — overhead_bench
+        run: |
+          jq -s '
+            def bmf(mode):
+              {
+                ("overhead::" + mode + "::throughput_rps"): {"throughput": {"value": .throughput_rps}},
+                ("overhead::" + mode + "::mean_lat_ns"):    {"latency":    {"value": .mean_lat_ns}},
+                ("overhead::" + mode + "::p99_lat_ns"):     {"latency":    {"value": .p99_lat_ns}},
+                ("overhead::" + mode + "::p99_9_lat_ns"):   {"latency":    {"value": .p99_9_lat_ns}}
+              };
+            (.[0] | bmf("baseline")) * (.[1] | bmf("telemetry")) * (.[2] | bmf("noop"))
+          ' /tmp/ob_baseline.json /tmp/ob_telemetry.json /tmp/ob_noop.json > /tmp/ob_bmf.json
+          bencher run \
+            --project dial9-tokio-telemetry \
+            --token '${{ secrets.BENCHER_API_TOKEN }}' \
+            --branch '${{ github.head_ref }}' \
+            --start-point main \
+            --start-point-reset \
+            --testbed ubuntu-latest \
+            --adapter json \
+            --threshold-test percentage \
+            --threshold-upper-boundary 0.25 \
+            --error-on-alert \
+            --github-actions '${{ secrets.GITHUB_TOKEN }}' \
+            "cat /tmp/ob_bmf.json"
