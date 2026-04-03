@@ -122,7 +122,7 @@ fn main() -> std::io::Result<()> {
 
     for file in &files {
         let data = std::fs::read(file)?;
-        let events = format::decode_events_v2(&data)?;
+        let events = format::decode_events(&data)?;
         for event in &events {
             match event {
                 TelemetryEvent::SegmentMetadata { entries, .. } => {

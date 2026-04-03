@@ -40,7 +40,11 @@ pub(crate) struct FlushStats {
 /// Perform one flush cycle: drain CPU profilers, drain the collector, write
 /// events to disk, and flush the writer. This is the only code path that
 /// touches EventWriter, and it runs exclusively on the flush thread.
-fn flush_once(event_writer: &mut EventWriter, shared: &SharedState) -> FlushStats {
+fn flush_once(
+    event_writer: &mut EventWriter,
+    shared: &SharedState,
+    drain_self: bool,
+) -> FlushStats {
     let events_before = event_writer.events_written();
     let cpu_events_time = Instant::now();
     #[cfg(feature = "cpu-profiling")]
@@ -49,10 +53,12 @@ fn flush_once(event_writer: &mut EventWriter, shared: &SharedState) -> FlushStat
     }
     let cpu_time = cpu_events_time.elapsed();
 
-    // Flush the current thread's buffer (the flush thread itself produces
-    // queue-sample events via record_event) so those events reach the
-    // collector before we drain it.
-    buffer::drain_to_collector(&shared.collector);
+    if drain_self {
+        // Periodically flush the flush thread's own TL buffer (queue samples + CPU events).
+        // We don't drain every cycle because each batch becomes its own trace segment;
+        // batching ~1s worth avoids writing tiny segments every 5ms.
+        buffer::drain_to_collector(&shared.collector);
+    }
 
     let dropped = shared.collector.take_dropped_batches();
     if dropped > 0 {
@@ -63,16 +69,16 @@ fn flush_once(event_writer: &mut EventWriter, shared: &SharedState) -> FlushStat
     }
 
     while let Some(batch) = shared.collector.next() {
-        for raw in batch {
-            if let Err(e) = event_writer.write_raw_event(raw) {
-                tracing::warn!("failed to write trace event: {e}");
-                shared.enabled.store(false, Ordering::Relaxed);
-                return FlushStats {
-                    event_count: event_writer.events_written() - events_before,
-                    dropped_batches: dropped as u64,
-                    cpu_time,
-                };
-            }
+        if batch.event_count > 0
+            && let Err(e) = event_writer.write_encoded_batch(&batch)
+        {
+            tracing::warn!("failed to transcode batch: {e}");
+            shared.enabled.store(false, Ordering::Relaxed);
+            return FlushStats {
+                event_count: event_writer.events_written() - events_before,
+                dropped_batches: dropped as u64,
+                cpu_time,
+            };
         }
     }
     if let Err(e) = event_writer.flush() {
@@ -690,6 +696,11 @@ impl TracedRuntimeBuilder<HasTracePath> {
                         let _ = libc::nice(10);
                     }
 
+                    // Drain the flush thread's own TL buffer every ~1s (200 × 5ms)
+                    // rather than every cycle, so queue samples and CPU events
+                    // are batched into reasonably-sized segments.
+                    let mut cycle_count: u64 = 0;
+                    const SELF_DRAIN_INTERVAL: u64 = 200;
                     let sample_interval = Duration::from_millis(10);
                     let mut last_sample = Instant::now();
                     // Snapshot the user-provided segment metadata so we can
@@ -734,8 +745,10 @@ impl TracedRuntimeBuilder<HasTracePath> {
                             event_writer.update_segment_metadata(merged);
                         }
 
+                        cycle_count += 1;
+                        let drain_self = exit || cycle_count.is_multiple_of(SELF_DRAIN_INTERVAL);
                         let mut flush_timer = Timer::start_now();
-                        let stats = flush_once(&mut event_writer, &shared);
+                        let stats = flush_once(&mut event_writer, &shared, drain_self);
                         flush_timer.stop();
                         if stats.event_count > 0 || stats.dropped_batches > 0 {
                             let _guard = FlushMetrics {
@@ -903,31 +916,45 @@ impl TracedRuntime {
 mod tests {
     use super::*;
     use crate::telemetry::NullWriter;
+    use crate::telemetry::collector::CentralCollector;
     use std::panic::Location;
+    use std::sync::Arc;
 
+    /// Drain all pending batches from a `CentralCollector` into an `EventWriter`.
+    /// Call `buffer::drain_to_collector` first to flush the thread-local buffer.
+    fn drain_collector_to_writer(collector: &CentralCollector, ew: &mut EventWriter) {
+        while let Some(batch) = collector.next() {
+            if batch.event_count > 0 {
+                ew.write_encoded_batch(&batch).unwrap();
+            }
+        }
+    }
     #[test]
     fn current_thread_runtime_resolves_worker_ids() {
-        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let ev = events.clone();
+        let data = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let data_clone = data.clone();
 
         let mut builder = tokio::runtime::Builder::new_current_thread();
         builder.enable_all();
 
         let writer = {
-            struct W(std::sync::Arc<std::sync::Mutex<Vec<crate::telemetry::events::RawEvent>>>);
+            struct W(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
             impl crate::telemetry::writer::TraceWriter for W {
-                fn write_event(
+                fn write_encoded_batch(
                     &mut self,
-                    event: &crate::telemetry::events::RawEvent,
+                    batch: &crate::telemetry::collector::Batch,
                 ) -> std::io::Result<()> {
-                    self.0.lock().unwrap().push(event.clone());
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .extend_from_slice(batch.encoded_bytes());
                     Ok(())
                 }
                 fn flush(&mut self) -> std::io::Result<()> {
                     Ok(())
                 }
             }
-            W(ev)
+            W(data_clone)
         };
 
         let (rt, guard) = TracedRuntime::builder()
@@ -945,11 +972,14 @@ mod tests {
         drop(rt);
         drop(guard);
 
-        let captured = events.lock().unwrap();
-        let poll_starts: Vec<_> = captured
+        let raw = data.lock().unwrap();
+        let events = crate::telemetry::format::decode_events(&raw).unwrap();
+        let poll_starts: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
-                crate::telemetry::events::RawEvent::PollStart { worker_id, .. } => Some(*worker_id),
+                crate::telemetry::events::TelemetryEvent::PollStart { worker_id, .. } => {
+                    Some(*worker_id)
+                }
                 _ => None,
             })
             .collect();
@@ -1026,26 +1056,35 @@ mod tests {
             .build()
             .unwrap();
         let mut ew = EventWriter::new(Box::new(writer));
+        let collector = Arc::new(CentralCollector::new());
 
         let locations = [
             location_a, location_b, location_a, location_b, location_a, location_b,
         ];
         for (i, loc) in locations.iter().enumerate() {
             let task_id = crate::telemetry::task_metadata::TaskId::from_u32(i as u32);
-            ew.write_raw_event(RawEvent::TaskSpawn {
-                timestamp_nanos: (i as u64 + 1) * 1000,
-                task_id,
-                location: loc,
-            })
-            .unwrap();
-            ew.write_raw_event(RawEvent::PollStart {
-                timestamp_nanos: (i as u64 + 1) * 1000,
-                worker_id: WorkerId::from(0usize),
-                worker_local_queue_depth: 0,
-                task_id,
-                location: loc,
-            })
-            .unwrap();
+            buffer::record_event(
+                RawEvent::TaskSpawn {
+                    timestamp_nanos: (i as u64 + 1) * 1000,
+                    task_id,
+                    location: loc,
+                },
+                &collector,
+            );
+            buffer::record_event(
+                RawEvent::PollStart {
+                    timestamp_nanos: (i as u64 + 1) * 1000,
+                    worker_id: WorkerId::from(0usize),
+                    worker_local_queue_depth: 0,
+                    task_id,
+                    location: loc,
+                },
+                &collector,
+            );
+            // Drain after each iteration to produce separate small batches
+            // that trigger file rotation (max_file_size is 100 bytes).
+            buffer::drain_to_collector(&collector);
+            drain_collector_to_writer(&collector, &mut ew);
         }
         ew.flush().unwrap();
         ew.finalize().unwrap();
@@ -1121,16 +1160,19 @@ mod tests {
         use std::collections::HashSet;
         use std::sync::{Arc, Mutex};
 
-        // Use a capturing writer to collect events
+        // Use a capturing writer to collect encoded bytes
         struct CapturingWriter {
-            events: Arc<Mutex<Vec<crate::telemetry::events::RawEvent>>>,
+            data: Arc<Mutex<Vec<u8>>>,
         }
         impl crate::telemetry::writer::TraceWriter for CapturingWriter {
-            fn write_event(
+            fn write_encoded_batch(
                 &mut self,
-                event: &crate::telemetry::events::RawEvent,
+                batch: &crate::telemetry::collector::Batch,
             ) -> std::io::Result<()> {
-                self.events.lock().unwrap().push(event.clone());
+                self.data
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(batch.encoded_bytes());
                 Ok(())
             }
             fn flush(&mut self) -> std::io::Result<()> {
@@ -1138,10 +1180,8 @@ mod tests {
             }
         }
 
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let writer = CapturingWriter {
-            events: events.clone(),
-        };
+        let data = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = CapturingWriter { data: data.clone() };
 
         let mut builder_a = tokio::runtime::Builder::new_multi_thread();
         builder_a.worker_threads(2);
@@ -1187,14 +1227,15 @@ mod tests {
         drop(runtime_b);
         drop(guard);
 
-        let captured = events.lock().unwrap();
+        let raw = data.lock().unwrap();
+        let captured = crate::telemetry::format::decode_events(&raw).unwrap();
         let mut worker_ids: HashSet<u64> = HashSet::new();
         for event in captured.iter() {
             match event {
-                crate::telemetry::events::RawEvent::PollStart { worker_id, .. }
-                | crate::telemetry::events::RawEvent::PollEnd { worker_id, .. }
-                | crate::telemetry::events::RawEvent::WorkerPark { worker_id, .. }
-                | crate::telemetry::events::RawEvent::WorkerUnpark { worker_id, .. } => {
+                crate::telemetry::events::TelemetryEvent::PollStart { worker_id, .. }
+                | crate::telemetry::events::TelemetryEvent::PollEnd { worker_id, .. }
+                | crate::telemetry::events::TelemetryEvent::WorkerPark { worker_id, .. }
+                | crate::telemetry::events::TelemetryEvent::WorkerUnpark { worker_id, .. } => {
                     if *worker_id != WorkerId::UNKNOWN {
                         worker_ids.insert(worker_id.as_u64());
                     }
@@ -1278,7 +1319,7 @@ mod tests {
         files.sort();
         for file in &files {
             let data = std::fs::read(file).unwrap();
-            let events = crate::telemetry::format::decode_events_v2(&data).unwrap();
+            let events = crate::telemetry::format::decode_events(&data).unwrap();
             for event in &events {
                 if let TelemetryEvent::SegmentMetadata { entries, .. } = event {
                     all_metadata.push(entries.clone());
@@ -1308,13 +1349,19 @@ mod tests {
     /// not local indices that collide with runtime A's workers.
     #[test]
     fn wake_events_use_global_worker_id_in_multi_runtime() {
-        use crate::telemetry::events::RawEvent;
+        use crate::telemetry::events::TelemetryEvent;
         use std::sync::{Arc, Mutex};
 
-        struct CapturingWriter(Arc<Mutex<Vec<RawEvent>>>);
+        struct CapturingWriter(Arc<Mutex<Vec<u8>>>);
         impl crate::telemetry::writer::TraceWriter for CapturingWriter {
-            fn write_event(&mut self, event: &RawEvent) -> std::io::Result<()> {
-                self.0.lock().unwrap().push(event.clone());
+            fn write_encoded_batch(
+                &mut self,
+                batch: &crate::telemetry::collector::Batch,
+            ) -> std::io::Result<()> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(batch.encoded_bytes());
                 Ok(())
             }
             fn flush(&mut self) -> std::io::Result<()> {
@@ -1322,13 +1369,13 @@ mod tests {
             }
         }
 
-        let events = Arc::new(Mutex::new(Vec::new()));
+        let data = Arc::new(Mutex::new(Vec::<u8>::new()));
 
         let mut builder_a = tokio::runtime::Builder::new_multi_thread();
         builder_a.worker_threads(2);
         let (runtime_a, guard) = TracedRuntime::builder()
             .with_task_tracking(true)
-            .build_and_start_with_writer(builder_a, CapturingWriter(events.clone()))
+            .build_and_start_with_writer(builder_a, CapturingWriter(data.clone()))
             .unwrap();
 
         let mut builder_b = tokio::runtime::Builder::new_multi_thread();
@@ -1356,11 +1403,12 @@ mod tests {
         drop(runtime_b);
         drop(guard);
 
-        let captured = events.lock().unwrap();
+        let raw = data.lock().unwrap();
+        let captured = crate::telemetry::format::decode_events(&raw).unwrap();
         let wake_workers: Vec<u8> = captured
             .iter()
             .filter_map(|e| match e {
-                RawEvent::WakeEvent { target_worker, .. } => Some(*target_worker),
+                TelemetryEvent::WakeEvent { target_worker, .. } => Some(*target_worker),
                 _ => None,
             })
             .collect();
@@ -1465,7 +1513,8 @@ mod tests {
                         callchain: callchain.clone(),
                     };
                     *timestamp += 1;
-                    ew.write_cpu_event(&data);
+                    ew.write_raw_event(RawEvent::CpuSample(Box::new(data)))
+                        .unwrap();
                 }
             }
 
