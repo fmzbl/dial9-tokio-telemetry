@@ -9,13 +9,13 @@
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use dial9_tokio_telemetry::telemetry::Batch;
-use tempfile::TempDir;
 use dial9_tokio_telemetry::telemetry::format::{
     PollEndEvent, PollStartEvent, TaskSpawnEvent, WakeEventEvent, WorkerParkEvent,
     WorkerUnparkEvent,
 };
 use dial9_tokio_telemetry::telemetry::{RotatingWriter, TaskId, TraceWriter, WorkerId};
 use dial9_trace_format::encoder::Encoder;
+use tempfile::TempDir;
 
 /// Build a realistic batch simulating a worker thread's activity.
 ///
@@ -95,8 +95,7 @@ fn bench_writer_encode(c: &mut Criterion) {
             &batches,
             |b, batches| {
                 let tmp = TempDir::new().unwrap();
-                let mut writer =
-                    RotatingWriter::single_file(tmp.path().join("trace")).unwrap();
+                let mut writer = RotatingWriter::single_file(tmp.path().join("trace")).unwrap();
                 b.iter(|| {
                     for batch in batches {
                         writer.write_encoded_batch(batch).unwrap();
