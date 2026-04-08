@@ -99,7 +99,7 @@ async fn run_client(
 // ── Benchmark runner ────────────────────────────────────────────────────────
 
 struct BenchResult {
-    hist: Histogram<u64>,
+    hist: Histogram<u64>, // latency values in nanoseconds
     wall: Duration,
 }
 
