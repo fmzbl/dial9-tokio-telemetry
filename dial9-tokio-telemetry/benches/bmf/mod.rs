@@ -1,5 +1,4 @@
 //! Bencher Metric Format (BMF) helpers.
-//! Include from any bench with `#[path = "bmf.rs"] mod bmf;`
 //! Spec: <https://bencher.dev/docs/reference/bencher-metric-format/>
 
 use serde::Serialize;

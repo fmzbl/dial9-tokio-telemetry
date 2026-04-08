@@ -15,7 +15,6 @@
 //! Duration defaults to 30 seconds. A 3-second warmup precedes measurement.
 //! --bmf runs all three modes and outputs Bencher Metric Format JSON.
 
-#[path = "bmf.rs"]
 mod bmf;
 
 #[cfg(target_os = "linux")]
