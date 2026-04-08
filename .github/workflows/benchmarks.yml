@@ -1,9 +1,10 @@
 # Continuous benchmarking with Bencher (https://bencher.dev)
 #
 # PREREQUISITES:
-#   1. Create a project at https://bencher.dev with slug: dial9-tokio-telemetry
-#   2. Generate an API token and add it as secret BENCHER_API_TOKEN in:
-#      GitHub → Settings → Secrets and variables → Actions
+#   1. Create a project at https://bencher.dev and note its slug.
+#   2. Add the following secrets in GitHub → Settings → Secrets and variables → Actions:
+#      - BENCHER_API_TOKEN: API token from bencher.dev
+#      - BENCHER_PROJECT:   your project slug
 #   3. GITHUB_TOKEN is provided automatically — no setup needed.
 #
 # overhead_bench uses a custom harness (not Criterion). Its --bmf flag
@@ -31,6 +32,7 @@ jobs:
     timeout-minutes: 30
     env:
       RUST_BACKTRACE: 1
+      BENCHER_PROJECT: ${{ secrets.BENCHER_PROJECT }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -46,7 +48,6 @@ jobs:
       - name: Benchmark — poll_overhead
         run: |
           bencher run \
-            --project dial9-tokio-telemetry \
             --token '${{ secrets.BENCHER_API_TOKEN }}' \
             --branch main \
             --testbed ubuntu-latest \
@@ -56,7 +57,6 @@ jobs:
       - name: Benchmark — writer_encode
         run: |
           bencher run \
-            --project dial9-tokio-telemetry \
             --token '${{ secrets.BENCHER_API_TOKEN }}' \
             --branch main \
             --testbed ubuntu-latest \
@@ -66,7 +66,6 @@ jobs:
       - name: Benchmark — codec
         run: |
           bencher run \
-            --project dial9-tokio-telemetry \
             --token '${{ secrets.BENCHER_API_TOKEN }}' \
             --branch main \
             --testbed ubuntu-latest \
@@ -76,7 +75,6 @@ jobs:
       - name: Benchmark — overhead_bench
         run: |
           bencher run \
-            --project dial9-tokio-telemetry \
             --token '${{ secrets.BENCHER_API_TOKEN }}' \
             --branch main \
             --testbed ubuntu-latest \
@@ -92,6 +90,7 @@ jobs:
     timeout-minutes: 30
     env:
       RUST_BACKTRACE: 1
+      BENCHER_PROJECT: ${{ secrets.BENCHER_PROJECT }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -107,7 +106,6 @@ jobs:
       - name: Benchmark — poll_overhead
         run: |
           bencher run \
-            --project dial9-tokio-telemetry \
             --token '${{ secrets.BENCHER_API_TOKEN }}' \
             --branch '${{ github.head_ref }}' \
             --start-point main \
@@ -123,7 +121,6 @@ jobs:
       - name: Benchmark — writer_encode
         run: |
           bencher run \
-            --project dial9-tokio-telemetry \
             --token '${{ secrets.BENCHER_API_TOKEN }}' \
             --branch '${{ github.head_ref }}' \
             --start-point main \
@@ -139,7 +136,6 @@ jobs:
       - name: Benchmark — codec
         run: |
           bencher run \
-            --project dial9-tokio-telemetry \
             --token '${{ secrets.BENCHER_API_TOKEN }}' \
             --branch '${{ github.head_ref }}' \
             --start-point main \
@@ -155,7 +151,6 @@ jobs:
       - name: Benchmark — overhead_bench
         run: |
           bencher run \
-            --project dial9-tokio-telemetry \
             --token '${{ secrets.BENCHER_API_TOKEN }}' \
             --branch '${{ github.head_ref }}' \
             --start-point main \
