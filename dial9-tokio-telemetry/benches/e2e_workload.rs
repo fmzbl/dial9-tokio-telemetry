@@ -1,6 +1,8 @@
 //! Runs a fixed-size mixed CPU/IO workload — modelled on the
 // realistic_workload example;
 
+mod bmf;
+
 #[cfg(target_os = "linux")]
 use dial9_tokio_telemetry::telemetry::CpuProfilingConfig;
 use dial9_tokio_telemetry::telemetry::{RotatingWriter, TracedRuntime};
