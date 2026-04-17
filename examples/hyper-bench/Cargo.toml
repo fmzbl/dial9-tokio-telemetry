@@ -1,0 +1,47 @@
+[package]
+name = "hyper-bench"
+edition = "2024"
+version = "0.1.0"
+publish = false
+
+# Mirrors hyper's own benches/. Run with nightly:
+#   cargo +nightly bench -p hyper-bench                       # baseline
+#   cargo +nightly bench -p hyper-bench --features telemetry  # with dial9
+
+[features]
+default = []
+telemetry = ["dep:dial9-tokio-telemetry"]
+
+[dependencies]
+dial9-tokio-telemetry = { path = "../../dial9-tokio-telemetry", optional = true }
+
+[dev-dependencies]
+hyper = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+http-body = "1"
+http-body-util = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["alloc", "sink"] }
+futures-channel = { version = "0.3", features = ["sink"] }
+pin-project-lite = "0.2"
+pretty_env_logger = "0.5"
+
+[[bench]]
+name = "body"
+path = "benches/body.rs"
+
+[[bench]]
+name = "connect"
+path = "benches/connect.rs"
+
+[[bench]]
+name = "end_to_end"
+path = "benches/end_to_end.rs"
+
+[[bench]]
+name = "pipeline"
+path = "benches/pipeline.rs"
+
+[[bench]]
+name = "server"
+path = "benches/server.rs"

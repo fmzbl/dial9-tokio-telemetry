@@ -7,6 +7,7 @@ members = [
     "dial9-viewer",
     "perf-self-profile",
     "examples/metrics-service",
+    "examples/hyper-bench",
 ]
 exclude = [
     "dial9-trace-format/fuzz",
