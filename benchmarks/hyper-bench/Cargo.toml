@@ -5,12 +5,16 @@ version = "0.1.0"
 publish = false
 
 # Mirrors hyper's own benches/. Run with nightly:
-#   cargo +nightly bench -p hyper-bench                       # baseline
-#   cargo +nightly bench -p hyper-bench --features telemetry  # with dial9
+#   cargo +nightly bench -p hyper-bench                                    # baseline
+#   cargo +nightly bench -p hyper-bench --features telemetry               # with dial9 + RotatingWriter
+#   cargo +nightly bench -p hyper-bench --features telemetry,null-writer   # with dial9 + NullWriter (no disk I/O)
 
 [features]
 default = []
 telemetry = ["dep:dial9-tokio-telemetry"]
+# Implies `telemetry`; swaps RotatingWriter for NullWriter to isolate hook
+# overhead from disk I/O. Has no effect unless `telemetry` is also enabled.
+null-writer = ["telemetry"]
 
 [dependencies]
 dial9-tokio-telemetry = { path = "../../dial9-tokio-telemetry", optional = true }

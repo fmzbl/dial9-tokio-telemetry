@@ -1,9 +1,11 @@
 //! Single seam for swapping a plain Tokio runtime for a dial9-instrumented one.
 //!
-//! Gate with the `telemetry` cargo feature:
-//!   off → plain `tokio::runtime`
-//!   on  → `TracedRuntime` writing to `DIAL9_TRACE_PATH`
-//!         (default `/tmp/hyper_bench_trace.bin`)
+//! Gate with cargo features:
+//!   (none)                    → plain `tokio::runtime`
+//!   telemetry                 → `TracedRuntime` with `RotatingWriter` at
+//!                               `DIAL9_TRACE_PATH` (default `/tmp/hyper_bench_trace.bin`)
+//!   telemetry + null-writer   → `TracedRuntime` with `NullWriter` (no disk I/O;
+//!                               isolates hook overhead from the writer path)
 
 use tokio::runtime::{Builder, Runtime};
 
@@ -19,7 +21,7 @@ pub fn build_rt(builder: Builder) -> (Runtime, BenchGuard) {
     (builder.build().expect("rt build"), ())
 }
 
-#[cfg(feature = "telemetry")]
+#[cfg(all(feature = "telemetry", not(feature = "null-writer")))]
 pub fn build_rt(builder: Builder) -> (Runtime, BenchGuard) {
     use dial9_tokio_telemetry::telemetry::{RotatingWriter, TracedRuntime};
 
@@ -33,4 +35,11 @@ pub fn build_rt(builder: Builder) -> (Runtime, BenchGuard) {
         .expect("rotating writer");
 
     TracedRuntime::build_and_start(builder, writer).expect("traced rt build")
+}
+
+#[cfg(all(feature = "telemetry", feature = "null-writer"))]
+pub fn build_rt(builder: Builder) -> (Runtime, BenchGuard) {
+    use dial9_tokio_telemetry::telemetry::{NullWriter, TracedRuntime};
+
+    TracedRuntime::build_and_start(builder, NullWriter).expect("traced rt build")
 }

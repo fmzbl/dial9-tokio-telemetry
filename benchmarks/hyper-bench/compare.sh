@@ -2,14 +2,16 @@
 # Run hyper benches baseline vs with dial9 telemetry, print per-bench overhead.
 #
 # Usage:
-#   ./compare.sh                  # run all (non-ignored) benches
-#   ./compare.sh http1_           # pass any substring to cargo bench as a filter
+#   ./compare.sh                                  # run all (non-ignored) benches
+#   ./compare.sh http1_                           # pass any substring to cargo bench as a filter
+#   FEATURES=telemetry,null-writer ./compare.sh   # compare vs NullWriter (no disk I/O)
 
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
 FILTER="${1:-}"
+FEATURES="${FEATURES:-telemetry}"
 BASE=$(mktemp)
 TELE=$(mktemp)
 trap 'rm -f "$BASE" "$TELE" "$BASE.tsv" "$TELE.tsv"' EXIT
@@ -18,8 +20,8 @@ echo ">>> baseline"
 cargo +nightly bench -p hyper-bench -- $FILTER 2>&1 | tee "$BASE"
 
 echo
-echo ">>> telemetry"
-cargo +nightly bench -p hyper-bench --features telemetry -- $FILTER 2>&1 | tee "$TELE"
+echo ">>> telemetry ($FEATURES)"
+cargo +nightly bench -p hyper-bench --features "$FEATURES" -- $FILTER 2>&1 | tee "$TELE"
 
 # Extract "name  ns_per_iter" from lines like:
 #   test some::name ... bench:  216.36 ns/iter (+/- 4.52) = 9259 MB/s
